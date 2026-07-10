@@ -1,0 +1,1 @@
+# hermes-obsidian-bridge

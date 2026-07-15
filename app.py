@@ -219,7 +219,7 @@ def extract_context(
     # 前方段落は最小3段落、最大3000文字まで
     for i in range(target_idx - 1, -1, -1):
         prev_p.insert(0, paragraphs[i][2])
-        if len(prev_p) >= 3 or sum(len(p) for p in prev_p) >= 3000:
+        if len(prev_p) >= 3 and sum(len(p) for p in prev_p) >= 3000:
             break
     # もしも前方段落でファイル先頭までたどり着いていれば、`<start of file>`を追加しておく
     if target_idx - len(prev_p) == 0:
@@ -227,7 +227,7 @@ def extract_context(
     # 後方段落は最小1段落、最大1000文字まで
     for i in range(target_idx + 1, len(paragraphs)):
         next_p.append(paragraphs[i][2])
-        if len(next_p) >= 1 or sum(len(p) for p in next_p) >= 1000:
+        if len(next_p) >= 1 and sum(len(p) for p in next_p) >= 1000:
             break
     # もしも後方段落でファイル末尾までたどり着いていれば、`<end of file>`を追加しておく
     if target_idx + len(next_p) == len(paragraphs) - 1:

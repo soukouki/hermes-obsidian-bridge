@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """
-Hermes Obsidian Watcher
+Hermes Obsidian Bridge
 ------------------------
-Obsidianのノート内に記述された `@Hermes` を検出し、別マシン上で動作する
+Obsidianのノート内に記述された `@Hermes` のようなタグを検出し、別マシン上で動作する
 Hermes Agent ゲートウェイ(HTTP API)にリクエストを送り、結果をノートに
 書き戻すデーモン。
 
@@ -10,8 +10,8 @@ Hermes Agent ゲートウェイ(HTTP API)にリクエストを送り、結果を
 ポーリングなしで軽量に動作する。
 
 処理の流れ:
-    1. ノート内で未処理の "@Hermes" を検出
-    2. 直後を "@Hermes👀<!-- hermes-id:XXXX -->" に即座に書き換え、
+    1. ノート内で未処理のタグを検出
+    2. 直後を "@<Tag>👀<!-- hermes-id:XXXX -->" に即座に書き換え、
        その段落の直後に「実行中」callout(id付き)を挿入する
        (この書き換え自体もinotifyイベントを発火させるが、マーカーが
         付いているため再検出されず、二重処理を防げる)
@@ -21,10 +21,10 @@ Hermes Agent ゲートウェイ(HTTP API)にリクエストを送り、結果を
        thinking(reasoning)やtool呼び出しの様子を蓄積する。
        ただし更新しすぎるとファイルが荒れるため、PROGRESS_UPDATE_INTERVAL秒
        ごとに、その時点までの経過を「実行中」calloutに追記していく
-    5. 最終結果が返ってきたら "@Hermes👀..." を "@Hermes✅️..." に置き換え、
+    5. 最終結果が返ってきたら "@<Tag>👀..." を "@<Tag>✅️..." に置き換え、
        「実行中」callout(thinkingの内容)をまるごと最終結果のcalloutで
        上書きする(thinkingの跡は残さない)
-    6. エラー時は "@Hermes⚠️..." にし、手動で "@Hermes" に戻せば再試行可能
+    6. エラー時は "@<Tag>⚠️..." にし、手動で "@<Tag>" に戻せば再試行可能
 
 依存:
     pip install inotify_simple requests --break-system-packages
@@ -51,10 +51,13 @@ import threading
 import time
 import uuid
 from concurrent.futures import ThreadPoolExecutor
+from dataclasses import dataclass
 from pathlib import Path
 
 import requests
+import yaml
 from inotify_simple import INotify, flags
+
 
 # ============================================================
 # 設定(環境に合わせて変更してください)
@@ -64,10 +67,9 @@ VAULT_DIR = Path(os.getenv("VAULT_DIR", "/vault"))
 HERMES_BASE = os.getenv("HERMES_BASE", "http://localhost:8642")
 API_KEY = os.getenv("API_KEY", "api_server_key")
 
-TRIGGER_TAG = "@Hermes"
 EMOJI_SEEN = "👀"     # 処理開始
 EMOJI_DONE = "✅️"     # 処理完了
-EMOJI_ERROR = "⚠️"    # エラー(手動でTRIGGER_TAGに書き戻せば再試行される)
+EMOJI_ERROR = "⚠️"    # エラー(手動でトリガータグに書き戻せば再試行される)
 
 # 監視・スキャンから除外するディレクトリ名
 EXCLUDE_DIRS = {".git", ".obsidian", ".trash", "node_modules"}
@@ -93,27 +95,134 @@ logging.basicConfig(
 log = logging.getLogger("hermes-watcher")
 
 # ============================================================
-# 正規表現
+# エージェント設定
 # ============================================================
 
-# まだ絵文字が付いていない生の @Hermes を検出
+@dataclass(frozen=True)
+class AgentConfig:
+    """config.yaml から読み込む1エージェントの設定。"""
+    tag: str
+    aliases: tuple[str, ...]
+    model: str | None
+    provider: str # default: "auto"
+    front: str
+    back: str
+
+# デフォルト設定(config.yaml が存在しない場合のフォールバック)
+DEFAULT_FRONT = (
+    "あなたはObsidianのノート「{note_title}」内で呼び出されたアシスタントです。"
+    "以下はそのノートの該当箇所の抜粋です。"
+)
+DEFAULT_BACK = (
+    "上記の文脈を踏まえて、必要であれば検索やプログラム実行などを行った上で、"
+    "結果を簡潔に(目安3〜6行)日本語でまとめてください。"
+    "必要に応じて、ObsidianのMCPツールを用いてこのノートや関連する他のノートを参照(閲覧)しても構いませんが、"
+    "このノート自体を編集・書き換えるツールは使わないでください。回答はノートを直接編集するのではなく、"
+    "単純にテキストとして返してください。ノートへの反映はこの後スクリプト側で自動的に行います。"
+    "Markdown形式で、前置きや後置きなしに本文のみを返してください。"
+    "絶対に「結果はこのとおりです」「以下Markdown形式で回答します」「```markdown」などの前置き文は書かないでください。"
+    "コールアウトの引用は自動で付与されるので不要です。"
+)
+
+CONFIG_PATH = Path(os.getenv("CONFIG_PATH", str(Path(__file__).parent / "config.yaml")))
+
+def load_config() -> list[AgentConfig]:
+    """
+    config.yaml からエージェント設定を読み込む。
+
+    戻り値: エージェントリスト (優先度順: 明示的 @ タグ > エイリアス)
+    """
+    if not CONFIG_PATH.exists():
+        log.warning("config.yaml が見つかりません: %s (デフォルト設定を使用)", CONFIG_PATH)
+        return _default_agents()
+
+    try:
+        with open(CONFIG_PATH, encoding="utf-8") as f:
+            raw = yaml.safe_load(f)
+    except Exception:
+        log.exception("config.yaml の解析に失敗しました: %s (デフォルト設定を使用)", CONFIG_PATH)
+        return _default_agents()
+
+    agents_data = raw.get("agents") or {}
+    default_section = raw.get("default") or {}
+    default_front = default_section.get("front") or DEFAULT_FRONT
+    default_back = default_section.get("back") or DEFAULT_BACK
+
+    agents: list[AgentConfig] = []
+    default_alias_holder: str | None = None
+
+    # default セクションから front/back を補間
+    def _interp(s: str) -> str:
+        # config.yaml の default.front では {note_title} は補間しない
+        return s
+
+    for tag, cfg in agents_data.items():
+        if not isinstance(cfg, dict):
+            continue
+        front = cfg.get("front") or _interp(default_front)
+        back = cfg.get("back") or _interp(default_back)
+        aliases = tuple(cfg.get("aliases") or [])
+        model = cfg.get("model")
+        provider = cfg.get("provider") or "auto"
+        agents.append(AgentConfig(
+            tag=tag,
+            aliases=aliases,
+            model=model,
+            provider=provider,
+            front=front,
+            back=back,
+        ))
+        # @Hermes エイリアスを持つエージェントをデフォルトとする
+        if "@Hermes" in aliases and default_alias_holder is None:
+            default_alias_holder = tag
+
+    # デフォルト設定
+    if not agents:
+        return _default_agents(), "@Hermes"
+
+    return agents
+
+def _default_agents() -> list[AgentConfig]:
+    return [AgentConfig(
+        tag="@Hermes",
+        aliases=(),
+        model=None,
+        provider="auto",
+        front=DEFAULT_FRONT,
+        back=DEFAULT_BACK,
+    )]
+
+# 設定を1回だけロード (モジュールレベル)
+_AGENTS = load_config()
+
+# すべてのトリガータグ + エイリアス (検出/サニタイズ対象)
+_ALL_TRIGGERS = set()
+_TAG_TO_AGENT: dict[str, AgentConfig] = {}
+for _a in _AGENTS:
+    _ALL_TRIGGERS.add(_a.tag)
+    _TAG_TO_AGENT[_a.tag] = _a
+    for _alias in _a.aliases:
+        _ALL_TRIGGERS.add(_alias)
+        _TAG_TO_AGENT[_alias] = _a
+
+# @<Tag>　のような生タグを検出 (すべての登録済みユーザー対象)
+# ただしすでにマーカー付き (👀/✅️/⚠️) のものは除外
+_MARKER_PREFIX = f"<!-- hermes"
+_TRIBUTE_PATTERN = r"(?<!@)(" + "|".join(re.escape(t) for t in _ALL_TRIGGERS) + r")"
 TRIGGER_RE = re.compile(
-    re.escape(TRIGGER_TAG)
-    + r"(?!%s|%s|%s)" % tuple(re.escape(e) for e in (EMOJI_SEEN, EMOJI_DONE, EMOJI_ERROR))
+    _TRIBUTE_PATTERN + r"(?![👀✅⚠️])"
 )
 
 
-def seen_marker_re(request_id: str) -> re.Pattern:
+def seen_marker_re(tag: str, request_id: str) -> re.Pattern:
     """処理中マーカー(IDつき)を探すための正規表現。"""
     return re.compile(
-        re.escape(f"{TRIGGER_TAG}{EMOJI_SEEN}<!-- hermes-id:{request_id} -->")
+        re.escape(f"{tag}{EMOJI_SEEN}<!-- hermes-id:{request_id} -->")
     )
 
 
 # 実行中calloutを識別するためのIDコメント。
-# Obsidianのcalloutタイトル行は既に [!type] のマークが付いているため、
-# そこに絵文字などを追加するのではなく、本文側にHTMLコメントとして
-# IDを埋め込む(プレビュー表示では見えない)。
+# calloutの本文側にHTMLコメントとしてIDを埋め込む(プレビュー表示では見えない)。
 def progress_id_comment(request_id: str) -> str:
     return f"<!-- hermes-progress-id:{request_id} -->"
 
@@ -122,9 +231,9 @@ def progress_callout_re(request_id: str) -> re.Pattern:
     """実行中callout全体(タイトル行〜本文の連続する`>`行)を探す正規表現。"""
     comment = re.escape(progress_id_comment(request_id))
     return re.compile(
-        r"^> \[![a-zA-Z-]+\][+-]?[^\n]*\n"      # callout タイトル行
-        r"> " + comment + r"\n"                  # ID コメント行
-        r"(?:^>.*\n)*",                           # 続く本文行(すべて`>`始まり、改行込み)
+        r"^> \[![a-zA-Z-]+\][+-]?[^\n]*\n" # callout タイトル行
+        r"> " + comment + r"\n"            # ID コメント行
+        r"(?:^>.*\n)*",                    # 続く本文行(すべて`>`始まり、改行込み)
         re.MULTILINE,
     )
 
@@ -158,7 +267,7 @@ def split_paragraphs(text: str) -> list[tuple[int, int, str]]:
     加えて、見出し行(`# ...` 形式のATX見出し)は、前後に空行がなく本文と
     地続きになっていても、見出し単独で1段落として切り出す。これにより
     「見出しの直後に本文が続く」ようなケースでも、見出しと本文の間に
-    自然な段落の隙間ができ、@Hermesの直後に何かを挿入する際にその隙間を
+    自然な段落の隙間ができ、@<Tag>の直後に何かを挿入する際にその隙間を
     使えるようになる。
     """
     paragraphs: list[tuple[int, int, str]] = []
@@ -195,7 +304,7 @@ def extract_context(
     text: str, match_start: int, match_end: int
 ) -> tuple[list[str] | None, str, list[str] | None]:
     """
-    @Hermesが含まれる段落、およびその前方数段落、後方数段落を取得する。
+    @<Tag>が含まれる段落、およびその前方数段落、後方数段落を取得する。
     前方は最小3段落で、多くて3000文字に収まる段落数。
     後方は最小1段落で、多くて1000文字に収まる段落数。
     戻り値: (前段落 or None, 対象段落, 次段落 or None)
@@ -221,9 +330,9 @@ def extract_context(
         prev_p.insert(0, paragraphs[i][2])
         if len(prev_p) >= 3 and sum(len(p) for p in prev_p) >= 3000:
             break
-    # もしも前方段落でファイル先頭までたどり着いていれば、`<start of file>`を追加しておく
+    # もしも前方段落でファイル先頭までたどり着いていれば、`<begin of file>`を追加しておく
     if target_idx - len(prev_p) == 0:
-        prev_p.insert(0, "<start of file>")
+        prev_p.insert(0, "<begin of file>")
     # 後方段落は最小1段落、最大1000文字まで
     for i in range(target_idx + 1, len(paragraphs)):
         next_p.append(paragraphs[i][2])
@@ -237,18 +346,21 @@ def extract_context(
 
 # ============================================================
 # プロンプト構築
-# ここだけを編集すればHermesへの指示内容・トーンなどを調整できる
+# config.yaml の front/back でカスタマイズできる
 # ============================================================
 
 def extract_user_request(target_paragraph: str) -> str:
-    """対象段落から @Hermes 以降のユーザー要望テキストを取り出す。"""
-    idx = target_paragraph.find(TRIGGER_TAG)
-    if idx == -1:
-        return target_paragraph.strip()
-    return target_paragraph[idx + len(TRIGGER_TAG):].strip()
+    """対象段落から @<Tag> 以降のユーザー要望テキストを取り出す。"""
+    # Match any registered trigger tag
+    for tag in _ALL_TRIGGERS:
+        idx = target_paragraph.find(tag)
+        if idx != -1:
+            return target_paragraph[idx + len(tag):].strip()
+    return target_paragraph.strip()
 
 
 def build_prompt(
+    agent: AgentConfig,
     note_title: str,
     prev_paragraphs: list[str] | None,
     target_paragraph: str,
@@ -256,31 +368,15 @@ def build_prompt(
 ) -> str:
     """
     Hermesに渡す最終的な指示文を組み立てる。
-    ノートのタイトルと前後の段落を文脈として渡し、要約の分量やトーンを
-    指定している。挙動を変えたい場合はここを編集する。
+    config.yaml の front/back を補間し、前後の段落を文脈として渡す。
     """
-    parts = [
-        f"あなたはObsidianのノート「{note_title}」内で呼び出されたアシスタントです。",
-        "以下はそのノートの該当箇所の抜粋です。",
-        "",
-    ]
+    parts = [agent.front.replace("{note_title}", note_title), ""]
     if prev_paragraphs:
         parts += ["--- 前方の段落 ---", *prev_paragraphs, ""]
-
-    parts += ["--- @Hermesが書かれた段落 ---", target_paragraph, ""]
-
+    parts += [f"--- {agent.tag} が書かれた段落 ---", target_paragraph, ""]
     if next_paragraphs:
         parts += ["--- 後方の段落 ---", *next_paragraphs, ""]
-
-    parts.append(
-        "上記の文脈を踏まえて、必要であれば検索やプログラム実行などを行った上で、結果を簡潔に(目安3〜6行)日本語でまとめてください。"
-        "必要に応じて、ObsidianのMCPツールを用いてこのノートや関連する他のノートを参照(閲覧)しても構いませんが、"
-        "このノート自体を編集・書き換えるツールは使わないでください。回答はノートを直接編集するのではなく、"
-        "単純にテキストとして返してください。ノートへの反映はこの後スクリプト側で自動的に行います。"
-        "Markdown形式で、前置きや後置きなしに本文のみを返してください。"
-        "絶対に「結果はこのとおりです」「以下Markdown形式で回答します」「```markdown」などの前置き文は書かないでください。"
-        "コールアウトの引用は自動で付与されるので不要です。"
-    )
+    parts.append(agent.back)
     return "\n".join(parts)
 
 
@@ -299,6 +395,29 @@ def escape_markdown(text: str) -> str:
     if not text:
         return text
     return _MD_ESCAPE_RE.sub(r"\\\1", text)
+
+
+# ============================================================
+# トリガー文字列のサニタイズ
+# ============================================================
+#
+# LLMの出力(思考経過の抜粋や最終結果)に「@Hermes」のような生の文字列が
+# 含まれてしまうと、それがノート内で `TRIGGER_RE` にヒットし、
+# 新しい未処理タスクとして再検知されてしまい、無限ループが発生する。
+# サニタイズにより、LLMが吐いたタグに衝突するものには即座に `✅️` マークを付けて
+# から書き込み、以降のスキャンで検出されないようにする。
+# `✅️` は完了マーカーなので、仮に再検知されても意味論的にはヒッツに
+# ならず安全に無視される(`TRIGGER_RE` はヒットしない)。
+# `TRIGGER_RE` と同じ否定先頭枠守を使って生の `@<Tag>` だけを抽出する。
+_SANITIZE_TRIGGER_RE = re.compile(
+    _TRIBUTE_PATTERN + r"(?![👀✅⚠️])"
+)
+
+def sanitize_trigger(text: str) -> str:
+    """LLM出力に含まれる生の @<Tag> を @<Tag>✅️ に置換して中立化する。"""
+    if not text:
+        return text
+    return _SANITIZE_TRIGGER_RE.sub(lambda m: m.group(0) + EMOJI_DONE, text)
 
 
 # ============================================================
@@ -370,6 +489,7 @@ class RunActivity:
                 # 独立したエントリとして追加する(build_progress_callout側で
                 # 各エントリに`> `を付けるため、ここでは改行を残さない)。
                 escaped = escape_markdown(preview)
+                escaped = sanitize_trigger(escaped)
                 sub_lines = [ln for ln in escaped.splitlines() if ln.strip()]
                 for i, ln in enumerate(sub_lines):
                     prefix = "🧠" if i == 0 else "  "
@@ -378,15 +498,15 @@ class RunActivity:
         elif event_type in ("tool.started", "tool_call.started"):
             tool = self._extract_tool_name(data, None)
             self._current_tool = tool
-            self._add(f"🔧 {escape_markdown(tool)} を実行中...")
+            self._add(f"🔧 {sanitize_trigger(escape_markdown(tool))} を実行中...")
 
         elif event_type in ("tool.completed", "tool_call.completed"):
             tool = self._extract_tool_name(data, self._current_tool)
-            self._add(f"✅ {escape_markdown(tool)} 完了")
+            self._add(f"✅ {sanitize_trigger(escape_markdown(tool))} 完了")
 
         elif event_type in ("tool.failed", "tool_call.failed"):
             tool = self._extract_tool_name(data, self._current_tool)
-            self._add(f"⚠️ {escape_markdown(tool)} 失敗")
+            self._add(f"⚠️ {sanitize_trigger(escape_markdown(tool))} 失敗")
 
         elif event_type in ("run.started",):
             self._add("🚀 実行を開始しました")
@@ -465,13 +585,17 @@ def run_progress_updater(
 # Hermes API 呼び出し
 # ============================================================
 
-def call_hermes_api(prompt: str, activity: RunActivity) -> str:
+def call_hermes_api(prompt: str, model: str | None, provider: str, activity: RunActivity) -> str:
     headers = {"Authorization": f"Bearer {API_KEY}"}
 
     # POST /v1/runs のレスポンスは {"run_id": "...", "status": "started"}
+    # model フィールドは PR #54426 パッチ適用後に有効
+    body: dict = {"input": prompt, "provider": provider}
+    if model:
+        body["model"] = model
     r = requests.post(
         f"{HERMES_BASE}/v1/runs",
-        json={"input": prompt},
+        json=body,
         headers=headers,
         timeout=30,
     )
@@ -593,11 +717,11 @@ def update_progress_callout(path: Path, request_id: str, lines: list[str]) -> No
         path.write_text(new_text, encoding="utf-8")
 
 
-def mark_seen(path: Path) -> tuple[str, str] | None:
+def mark_seen(path: Path) -> tuple[str, str, str, str] | None:
     """
-    ファイル内の最初の未処理 @Hermes を見つけ、👀マーカーに即座に置き換えて
+    ファイル内の最初の未処理 @<Tag> を見つけ、👀マーカーに即座に置き換えて
     書き込む。同時に、その段落の直後に「実行中」calloutを挿入する。
-    戻り値: (request_id, プロンプト) または 未検出ならNone。
+    戻り値: (request_id, prompt, model, tag) または 未検出ならNone。
     """
     lock = get_file_lock(str(path))
     with lock:
@@ -606,9 +730,18 @@ def mark_seen(path: Path) -> tuple[str, str] | None:
         if not m:
             return None
 
+        # マッチしたタグから対応する AgentConfig を解決
+        matched_tag = m.group(1)  # re キャプチャで取得
+        agent = _TAG_TO_AGENT.get(matched_tag)
+        if agent is None:
+            # フォールバック: デフォルトエージェント
+            agent = _AGENTS[0]
+            matched_tag = agent.tag
+        log.info("未処理トリガーを検出: tag=%s file=%s", matched_tag, path)
+
         prev_p, target_p, next_p = extract_context(text, m.start(), m.end())
         request_id = uuid.uuid4().hex[:8]
-        marker = f"{TRIGGER_TAG}{EMOJI_SEEN}<!-- hermes-id:{request_id} -->"
+        marker = f"{agent.tag}{EMOJI_SEEN}<!-- hermes-id:{request_id} -->"
 
         paragraphs = split_paragraphs(text)
         target_idx = next(
@@ -625,19 +758,21 @@ def mark_seen(path: Path) -> tuple[str, str] | None:
             )
         else:
             new_text = text[: m.start()] + marker + "\n\n" + callout + text[m.end():]
+        log.info("👀マーカーを挿入し、進捗calloutを追加しました: id=%s file=%s", request_id, path)
 
         path.write_text(new_text, encoding="utf-8")
 
         prompt = build_prompt(
+            agent=agent,
             note_title=path.stem,
             prev_paragraphs=prev_p,
             target_paragraph=target_p,
             next_paragraphs=next_p,
         )
-        return request_id, prompt
+        return request_id, prompt, agent.model, agent.provider, agent.tag
 
 
-def insert_result(path: Path, request_id: str, result_text: str, error: bool = False) -> None:
+def insert_result(path: Path, request_id: str, tag: str, result_text: str, error: bool = False) -> None:
     """
     対応するトリガーマーカーを✅️(エラー時は⚠️)に置き換え、
     「実行中」calloutをまるごと最終結果のcalloutで上書きする
@@ -648,10 +783,10 @@ def insert_result(path: Path, request_id: str, result_text: str, error: bool = F
         text = path.read_text(encoding="utf-8")
 
         # 1. トリガーマーカーを完了/エラーの絵文字に置き換え
-        sm = seen_marker_re(request_id).search(text)
+        sm = seen_marker_re(tag, request_id).search(text)
         final_emoji = EMOJI_ERROR if error else EMOJI_DONE
         if sm:
-            replaced_marker = f"{TRIGGER_TAG}{final_emoji}<!-- hermes-id:{request_id} -->"
+            replaced_marker = f"{tag}{final_emoji}<!-- hermes-id:{request_id} -->"
             text = text[: sm.start()] + replaced_marker + text[sm.end():]
         else:
             log.warning("トリガーマーカーが見つかりません: id=%s path=%s", request_id, path)
@@ -660,6 +795,7 @@ def insert_result(path: Path, request_id: str, result_text: str, error: bool = F
         callout_type = "error" if error else "note"
         if not error:
             result_text = strip_wrapping_callout(result_text)
+        result_text = sanitize_trigger(result_text)
         body_lines = result_text.splitlines() or [""]
         final_callout = (
             "> [!" + callout_type + "]\n"
@@ -700,10 +836,10 @@ def process_file(path: Path) -> None:
         log.exception("mark_seenに失敗しました: %s", path)
         return
     if result is None:
-        return  # 未処理の@Hermesなし
+        return  # 未処理のトリガーなし
 
-    request_id, prompt = result
-    log.info("処理開始 id=%s file=%s", request_id, path)
+    request_id, prompt, model, provider, tag = result
+    log.info("処理開始 id=%s file=%s tag=%s", request_id, path, tag)
 
     def worker() -> None:
         activity = RunActivity()
@@ -715,18 +851,18 @@ def process_file(path: Path) -> None:
         )
         updater_thread.start()
         try:
-            answer = call_hermes_api(prompt, activity)
-            insert_result(path, request_id, answer, error=False)
+            answer = call_hermes_api(prompt, model, provider, activity)
+            insert_result(path, request_id, tag, answer, error=False)
             log.info("処理完了 id=%s file=%s", request_id, path)
         except Exception as e:
             log.exception("Hermes呼び出しに失敗しました id=%s", request_id)
-            insert_result(path, request_id, f"エラーが発生しました: {e}", error=True)
+            insert_result(path, request_id, tag, f"エラーが発生しました: {e}", error=True)
         finally:
             done_event.set()
             updater_thread.join(timeout=5)
 
     executor.submit(worker)
-    # 同一ファイルに複数の未処理@Hermesがある場合に備え、続けて再スキャン
+    # 同一ファイルに複数の未処理@<Tag>がある場合に備え、続けて再スキャン
     executor.submit(process_file, path)
 
 
@@ -754,7 +890,7 @@ def main() -> None:
     add_watches_recursive(inotify, VAULT_DIR, wd_to_path)
     log.info("監視開始: %s (%d ディレクトリ)", VAULT_DIR, len(wd_to_path))
 
-    # 起動時に既存ファイル内の未処理@Hermesも一度スキャンしておく
+    # 起動時に既存ファイル内の未処理@<Tag>も一度スキャンしておく
     for md_path in VAULT_DIR.rglob("*.md"):
         if any(part in EXCLUDE_DIRS for part in md_path.parts):
             continue

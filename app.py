@@ -86,7 +86,7 @@ POLL_TIMEOUT = 600
 
 # 実行中callout(thinking/tool呼び出しの経過)をノートに書き戻す間隔(秒)。
 # 短くしすぎるとファイルの書き換えが頻発してうるさくなるので注意。
-PROGRESS_UPDATE_INTERVAL = 5
+PROGRESS_UPDATE_INTERVAL = 15
 
 logging.basicConfig(
     level=logging.INFO,
